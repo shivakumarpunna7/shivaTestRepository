@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- [y] hybris Platform Copyright (c) 2017 SAP SE or an SAP affiliate company. 
+	All rights reserved. This software is the confidential and proprietary information 
+	of SAP ("Confidential Information"). You shall not disclose such Confidential 
+	Information and shall use it only in accordance with the terms of the license 
+	agreement you entered into with SAP. -->
+
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:int="http://www.springframework.org/schema/integration"
+	xmlns:file="http://www.springframework.org/schema/integration/file"
+	xmlns:p="http://www.springframework.org/schema/p" xmlns:context="http://www.springframework.org/schema/context"
+	xsi:schemaLocation="http://www.springframework.org/schema/integration 
+	http://www.springframework.org/schema/integration/spring-integration.xsd
+	http://www.springframework.org/schema/integration/file 
+	http://www.springframework.org/schema/integration/file/spring-integration-file.xsd
+	http://www.springframework.org/schema/beans 
+	http://www.springframework.org/schema/beans/spring-beans.xsd
+	http://www.springframework.org/schema/context
+    http://www.springframework.org/schema/context/spring-context.xsd">
+
+	<context:annotation-config />
+
+	<bean id="shivaBaseDirectory" class="java.lang.String">
+		<constructor-arg
+			value="#{baseDirectory}/${tenantId}/shiva" />
+	</bean>
+
+	<!-- 1) Scan for files (used for internal products) -->
+
+	<file:inbound-channel-adapter id="shivaBatchFilesAdapter"
+		directory="#{shivaBaseDirectory}" filename-regex="^(.*)-(\d+)\.csv"
+		comparator="shivaFileOrderComparator" auto-startup="#{configurationService.configuration.getProperty('shiva.hotfolder.configuration.enabled')}">
+		<int:poller fixed-rate="1000" />
+	</file:inbound-channel-adapter>
+
+	<!-- 2) move the file to processing and setup header -->
+
+	<file:outbound-gateway request-channel="shivaBatchFilesAdapter"
+		directory="#{shivaBaseDirectory}/processing" reply-channel="shivaBatchFilesProc"
+		delete-source-files="true" />
+	
+	<!--  HeaderSetupTask -->	
+	
+	<int:service-activator input-channel="shivaBatchFilesProc"
+		output-channel="shivaBatchFilesHeaderInit" ref="shivaHeaderSetupTask"
+		method="execute" />
+	<bean id="shivaHeaderSetupTask"
+		class="de.hybris.platform.acceleratorservices.dataimport.batch.task.HeaderSetupTask">
+		<property name="catalog" value="shivab2b-usProductCatalog" />
+		<property name="net" value="false" />
+		<property name="storeBaseDirectory" ref="shivaBaseDirectory" />
+	</bean>
+	
+	<!-- HeaderInitTask -->	
+
+	<!-- 3) transform csv to impex file -->
+	
+	<int:service-activator input-channel="shivaBatchFilesHeaderInit"
+		output-channel="shivaBatchFilesTran" ref="shivaBatchTransformerTask" method="execute" />
+		
+	<bean id="shivaBatchTransformerTask"
+		class="de.hybris.platform.acceleratorservices.dataimport.batch.task.ImpexTransformerTask"
+		init-method="initConvertersMap">
+		<property name="fieldSeparator" value=";" />
+		<property name="encoding" value="UTF-8" />
+		<property name="linesToSkip" value="0" />
+		<property name="cleanupHelper" ref="cleanupHelper" />
+	</bean>
+
+	<!-- 4) run impex import -->
+	
+	<int:service-activator input-channel="shivaBatchFilesTran"
+		output-channel="shivaBatchFilesImp" ref="shivaBatchRunnerTask" method="execute" />
+		
+	<bean id="shivaBatchRunnerTask"
+		class="de.hybris.platform.acceleratorservices.dataimport.batch.task.AbstractImpexRunnerTask">
+		<property name="sessionService" ref="sessionService" />
+		<property name="importService" ref="importService" />
+		<lookup-method name="getImportConfig" bean="shivaImportConfig" />
+	</bean>
+	
+	<bean id="shivaImportConfig" class="de.hybris.platform.servicelayer.impex.ImportConfig" scope="prototype">
+		<property name="removeOnSuccess" value="true" />
+		<property name="failOnError" value="false" />
+		<property name="synchronous" value="true" />
+		<property name="legacyMode" value="false" />
+		<property name="maxThreads" value="#{configurationService.configuration.getProperty('shiva.batch.impex.max-threads')}" />
+		<property name="locale" value="en"/>
+	</bean>
+
+	<!-- 5) Cleanup -->
+	
+	<int:service-activator input-channel="shivaBatchFilesImp"
+		ref="shivaBatchCleanupTask" method="execute" />
+		
+	<bean id="shivaBatchCleanupTask"
+		class="de.hybris.platform.acceleratorservices.dataimport.batch.task.CleanupTask">
+		<property name="cleanupHelper" ref="cleanupHelper" />
+	</bean>
+	
+<!-- 	List Price -->
+	<bean id="shivaBatchPriceConverterMapping"
+		class="de.hybris.platform.acceleratorservices.dataimport.batch.converter.mapping.impl.DefaultConverterMapping"
+		p:mapping="listPrice" p:converter-ref="batchshivaPriceConverter" />
+		
+	<bean id="batchshivaPriceConverter" class="de.hybris.platform.acceleratorservices.dataimport.batch.converter.impl.DefaultImpexConverter">
+		<property name="header">
+			<value># ImpEx for Importing Prices into $CATALOG$
+				$catalog=$CATALOG$
+				#% impex.setLocale(Locale.ENGLISH); 
+				INSERT_UPDATE PriceRow;product(code,catalogversion(catalog(id),version))[unique=true];price[translator=de.hybris.platform.acceleratorservices.dataimport.batch.converter.PriceTranslator];currency(isocode)[unique=true];net[default=$NET$];unit(code)[default=pieces];unitFactor[default=1];minqtd[default=1];catalogversion(catalog(id),version)
+			</value>
+		</property>
+		<property name="impexRow">
+			<value>;{+0}:$catalog:Staged;{+1};{+2};{3};;;;$catalog:Staged</value>
+		</property>
+	</bean>
+	
+<!-- 	Customre specific price -->
+	<bean id="shivaBatchCustomerPriceConverterMapping"
+		class="de.hybris.platform.acceleratorservices.dataimport.batch.converter.mapping.impl.DefaultConverterMapping"
+		p:mapping="customerPrice" p:converter-ref="batchshivaCustomerPriceConverter" />
+		
+	<bean id="batchshivaCustomerPriceConverter" class="de.hybris.platform.acceleratorservices.dataimport.batch.converter.impl.DefaultImpexConverter">
+		<property name="header">
+			<value># ImpEx for Importing Prices into $CATALOG$
+				$catalog=$CATALOG$
+				#% impex.setLocale(Locale.ENGLISH); 
+				INSERT_UPDATE PriceRow;product(code,catalogversion(catalog(id),version))[unique=true];price[translator=de.hybris.platform.acceleratorservices.dataimport.batch.converter.PriceTranslator];currency(isocode)[unique=true];ug(code)[unique=true];net[default=$NET$];unit(code)[default=pieces];unitFactor[default=1];minqtd[default=1];catalogversion(catalog(id),version)
+			</value>
+		</property>
+		<property name="impexRow">
+			<value>;{+0}:$catalog:Staged;{+1};{+2};{+3};{4};;;;$catalog:Staged</value>
+		</property>
+	</bean>
+	
+	<bean id="shivaFileOrderComparator" class="de.hybris.platform.acceleratorservices.dataimport.batch.FileOrderComparator">
+		<property name="prefixPriority">
+			<map>
+				<!-- default priority is 0 -->
+				<entry key="listPrice" value="1" />
+				<entry key="customerPrice" value="2" />
+			</map>
+		</property>
+	</bean>
+
+	<!-- shiva -->
+</beans>
